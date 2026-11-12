@@ -1,0 +1,130 @@
+name: nightdemo-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SRC_TAG: src
+  SRC_ASSET: nightdemo-src.tar.gz
+  SRC_REPO: iamrunner1/nightdemo-ios
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - name: Fetch source snapshot from private repo
+        env:
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          ASSET_ID=$(curl -s -H "Authorization: token ${SRC_TOKEN}" \
+            -H "User-Agent: nightdemo-ci" \
+            "https://api.github.com/repos/${SRC_REPO}/releases/tags/${SRC_TAG}" \
+            | jq -r --arg n "${SRC_ASSET}" '.assets[] | select(.name==$n) | .id')
+          echo "asset id: ${ASSET_ID}"
+          test -n "${ASSET_ID}"
+          curl -sL -H "Authorization: token ${SRC_TOKEN}" \
+            -H "User-Agent: nightdemo-ci" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/${SRC_REPO}/releases/assets/${ASSET_ID}" \
+            -o src.tar.gz
+          ls -l src.tar.gz
+          tar -xzf src.tar.gz -C src
+          ls src | head -n 40
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version || true
+          cmake --version || true
+          sw_vers
+          xcode-select -p || true
+
+      - name: Setup ios-cmake
+        run: |
+          set -euo pipefail
+          cd src
+          mkdir -p thirdParty
+          cd thirdParty
+          if [ -f ios.toolchain.cmake ]; then echo "vendored toolchain"; exit 0; fi
+          ok=0
+          for i in 1 2 3; do
+            if curl -fsSL -o ios-cmake.zip "https://github.com/leetal/ios-cmake/archive/4.5.0.zip"; then ok=1; break; fi
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then echo "ios-cmake download failed"; exit 1; fi
+          unzip -oq ios-cmake.zip
+          mv -f ios-cmake-* ios-cmake
+          rm -f ios-cmake.zip
+          ls ios-cmake
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cd src
+          mkdir -p build
+          cd build
+          cmake .. -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE=../thirdParty/ios-cmake/ios.toolchain.cmake \
+            -DPLATFORM=OS64 \
+            -DDEPLOYMENT_TARGET=13.0 \
+            -DENABLE_BITCODE=0 \
+            -DENABLE_ARC=1 \
+            -DENABLE_VISIBILITY=0 2>&1 | tee cmake.log
+          echo "=== cmake tail ==="
+          tail -n 40 cmake.log
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd src/build
+          xcodebuild -project NightDemo.xcodeproj \
+            -target NightDemo \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            build 2>&1 | tee build.log
+          echo "=== build tail ==="
+          tail -n 60 build.log
+
+      - name: Package ipa
+        run: |
+          set -euo pipefail
+          cd src
+          APP=$(find build -type d -name "NightDemo.app" | head -n 1)
+          echo "APP=$APP"
+          ls -la "$APP"
+          test -d "$APP/Res/nakaimo" || (echo "Res missing"; exit 1)
+          test -d "$APP/FrameworkShaders" || (echo "shaders missing"; exit 1)
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry NightDemo.ipa Payload
+          ls -l NightDemo.ipa
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-and-ipa
+          path: |
+            src/out/NightDemo.ipa
+            src/build/build.log
+            src/build/cmake.log
+          if-no-files-found: ignore
+
+      - name: Publish release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-${{ github.run_number }}
+          name: NightDemo ipa ${{ github.run_number }}
+          files: src/out/NightDemo.ipa
+          fail_on_unmatched_files: false
+          token: ${{ secrets.GITHUB_TOKEN }}
